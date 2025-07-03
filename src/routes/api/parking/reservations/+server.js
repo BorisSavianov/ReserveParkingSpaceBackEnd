@@ -1,4 +1,6 @@
+// src/routes/api/parking/reservations/+server.js - Updated version
 import { json } from "@sveltejs/kit";
+import { authenticateRequest } from "$lib/auth-middleware.js";
 import {
   validateReservationPeriod,
   checkSpaceAvailability,
@@ -9,13 +11,17 @@ import { collection, addDoc, doc, getDoc } from "firebase/firestore";
 
 export async function POST({ request }) {
   try {
-    const authHeader = request.headers.get("authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return json({ success: false, error: "Unauthorized" }, { status: 401 });
+    // Authenticate the request
+    const authResult = await authenticateRequest(request);
+
+    if (!authResult.success) {
+      return json(
+        { success: false, error: authResult.error },
+        { status: authResult.status }
+      );
     }
 
-    const userId = authHeader.split(" ")[1]; // Simplified token handling
-
+    const { uid: userId } = authResult.user;
     const { spaceId, startDate, endDate, shiftType, scheduleDocument } =
       await request.json();
 
@@ -24,7 +30,21 @@ export async function POST({ request }) {
       return json(
         {
           success: false,
-          error: "Missing required fields",
+          error:
+            "Missing required fields: spaceId, startDate, endDate, shiftType",
+        },
+        { status: 400 }
+      );
+    }
+
+    // Validate shift type
+    const validShiftTypes = ["8:00-14:00", "14:00-21:00", "9:30-18:30"];
+    if (!validShiftTypes.includes(shiftType)) {
+      return json(
+        {
+          success: false,
+          error:
+            "Invalid shift type. Must be one of: " + validShiftTypes.join(", "),
         },
         { status: 400 }
       );
@@ -58,6 +78,18 @@ export async function POST({ request }) {
       );
     }
 
+    // Verify space exists
+    const spaceDoc = await getDoc(doc(db, "parkingSpaces", spaceId));
+    if (!spaceDoc.exists()) {
+      return json(
+        {
+          success: false,
+          error: "Parking space not found",
+        },
+        { status: 404 }
+      );
+    }
+
     // Check space availability
     const isAvailable = await checkSpaceAvailability(
       spaceId,
@@ -65,6 +97,7 @@ export async function POST({ request }) {
       endDate,
       shiftType
     );
+
     if (!isAvailable) {
       return json(
         {
@@ -96,6 +129,7 @@ export async function POST({ request }) {
     return json(
       {
         success: true,
+        message: "Reservation created successfully",
         reservation: {
           id: docRef.id,
           ...reservationData,
@@ -104,6 +138,7 @@ export async function POST({ request }) {
       { status: 201 }
     );
   } catch (error) {
+    console.error("Reservation creation error:", error);
     return json(
       {
         success: false,
@@ -116,23 +151,64 @@ export async function POST({ request }) {
 
 export async function GET({ request }) {
   try {
-    const authHeader = request.headers.get("authorization");
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return json({ success: false, error: "Unauthorized" }, { status: 401 });
+    // Authenticate the request
+    const authResult = await authenticateRequest(request);
+
+    if (!authResult.success) {
+      return json(
+        { success: false, error: authResult.error },
+        { status: authResult.status }
+      );
     }
 
-    const userId = authHeader.split(" ")[1];
-    const reservations = await getUserReservations(userId);
+    const { uid: userId } = authResult.user;
 
-    return json({
-      success: true,
-      reservations,
-    });
+    try {
+      const reservations = await getUserReservations(userId);
+
+      // Add space information to each reservation
+      const reservationsWithSpaces = await Promise.all(
+        reservations.map(async (reservation) => {
+          try {
+            const spaceDoc = await getDoc(
+              doc(db, "parkingSpaces", reservation.spaceId)
+            );
+            const spaceData = spaceDoc.exists() ? spaceDoc.data() : null;
+
+            return {
+              ...reservation,
+              space: spaceData,
+            };
+          } catch (error) {
+            console.error("Error fetching space data:", error);
+            return {
+              ...reservation,
+              space: null,
+            };
+          }
+        })
+      );
+
+      return json({
+        success: true,
+        reservations: reservationsWithSpaces,
+      });
+    } catch (error) {
+      console.error("Error fetching reservations:", error);
+      return json(
+        {
+          success: false,
+          error: "Failed to fetch reservations",
+        },
+        { status: 500 }
+      );
+    }
   } catch (error) {
+    console.error("Authentication error:", error);
     return json(
       {
         success: false,
-        error: "Failed to fetch reservations",
+        error: "Authentication failed",
       },
       { status: 500 }
     );

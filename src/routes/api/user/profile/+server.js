@@ -1,65 +1,135 @@
+// src/routes/api/user/profile/+server.js - Updated version
 import { json } from "@sveltejs/kit";
-import { auth, db } from "$lib/firebase.js";
-import { doc, getDoc } from "firebase/firestore";
+import { authenticateRequest } from "$lib/auth-middleware.js";
+import { db } from "$lib/firebase.js";
+import { doc, getDoc, updateDoc } from "firebase/firestore";
 
 export async function GET({ request }) {
   try {
-    const authHeader = request.headers.get("authorization");
+    // Authenticate the request
+    const authResult = await authenticateRequest(request);
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (!authResult.success) {
       return json(
-        {
-          success: false,
-          error: "Missing or invalid authorization header",
-        },
-        { status: 401 }
+        { success: false, error: authResult.error },
+        { status: authResult.status }
       );
     }
 
-    const token = authHeader.split(" ")[1];
-
-    // In a real implementation, you would verify the Firebase ID token here
-    // For now, we'll assume the token contains the user ID
-
-    try {
-      // This is simplified - in production, use Firebase Admin SDK to verify the token
-      const userId = token; // This should be extracted from verified JWT
-
-      const userDoc = await getDoc(doc(db, "users", userId));
-
-      if (!userDoc.exists()) {
-        return json(
-          {
-            success: false,
-            error: "User not found",
-          },
-          { status: 404 }
-        );
-      }
-
-      const userData = userDoc.data();
-
-      return json({
-        success: true,
-        user: {
-          uid: userId,
-          ...userData,
-        },
-      });
-    } catch (error) {
-      return json(
-        {
-          success: false,
-          error: "Invalid token",
-        },
-        { status: 401 }
-      );
-    }
+    return json({
+      success: true,
+      user: authResult.user,
+    });
   } catch (error) {
+    console.error("Profile fetch error:", error);
     return json(
       {
         success: false,
-        error: "Internal server error",
+        error: "Failed to fetch user profile",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function PUT({ request }) {
+  try {
+    // Authenticate the request
+    const authResult = await authenticateRequest(request);
+
+    if (!authResult.success) {
+      return json(
+        { success: false, error: authResult.error },
+        { status: authResult.status }
+      );
+    }
+
+    const { uid: userId } = authResult.user;
+    const updateData = await request.json();
+
+    // Define allowed fields for update
+    const allowedFields = ["firstName", "lastName", "department", "username"];
+    const filteredData = {};
+
+    // Only allow updating specific fields
+    for (const field of allowedFields) {
+      if (updateData[field] !== undefined) {
+        filteredData[field] = updateData[field];
+      }
+    }
+
+    // Validate required fields
+    if (Object.keys(filteredData).length === 0) {
+      return json(
+        {
+          success: false,
+          error: "No valid fields provided for update",
+        },
+        { status: 400 }
+      );
+    }
+
+    // Add update timestamp
+    filteredData.updatedAt = new Date().toISOString();
+
+    // Update user document
+    await updateDoc(doc(db, "users", userId), filteredData);
+
+    // Get updated user data
+    const userDoc = await getDoc(doc(db, "users", userId));
+    const userData = userDoc.data();
+
+    return json({
+      success: true,
+      message: "Profile updated successfully",
+      user: {
+        uid: userId,
+        email: authResult.user.email,
+        ...userData,
+      },
+    });
+  } catch (error) {
+    console.error("Profile update error:", error);
+    return json(
+      {
+        success: false,
+        error: "Failed to update user profile",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE({ request }) {
+  try {
+    // Authenticate the request
+    const authResult = await authenticateRequest(request);
+
+    if (!authResult.success) {
+      return json(
+        { success: false, error: authResult.error },
+        { status: authResult.status }
+      );
+    }
+
+    const { uid: userId } = authResult.user;
+
+    // Soft delete by marking as inactive
+    await updateDoc(doc(db, "users", userId), {
+      isActive: false,
+      deletedAt: new Date().toISOString(),
+    });
+
+    return json({
+      success: true,
+      message: "Account deactivated successfully",
+    });
+  } catch (error) {
+    console.error("Profile deletion error:", error);
+    return json(
+      {
+        success: false,
+        error: "Failed to deactivate account",
       },
       { status: 500 }
     );
