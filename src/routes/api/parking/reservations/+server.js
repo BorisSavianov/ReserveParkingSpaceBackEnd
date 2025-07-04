@@ -9,8 +9,8 @@ import {
 import {
   uploadPDFToGoogleDrive,
   validatePDFFile,
-  base64ToBuffer,
 } from "$lib/google-drive-storage.js";
+import { base64ToBuffer } from "$lib/file-upload.js";
 import {
   parseMultipartFormData,
   validateUploadedPDF,
