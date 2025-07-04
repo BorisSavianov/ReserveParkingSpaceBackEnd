@@ -1,4 +1,4 @@
-// src/routes/api/parking/reservations/+server.js - Updated version
+// src/routes/api/parking/reservations/+server.js - Updated with PDF upload
 import { json } from "@sveltejs/kit";
 import { authenticateRequest } from "$lib/auth-middleware.js";
 import {
@@ -6,6 +6,15 @@ import {
   checkSpaceAvailability,
   getUserReservations,
 } from "$lib/parking.js";
+import {
+  uploadPDFToGoogleDrive,
+  validatePDFFile,
+  base64ToBuffer,
+} from "$lib/google-drive-storage.js";
+import {
+  parseMultipartFormData,
+  validateUploadedPDF,
+} from "$lib/file-upload.js";
 import { db } from "$lib/firebase.js";
 import { collection, addDoc, doc, getDoc } from "firebase/firestore";
 
@@ -22,8 +31,73 @@ export async function POST({ request }) {
     }
 
     const { uid: userId } = authResult.user;
-    const { spaceId, startDate, endDate, shiftType, scheduleDocument } =
-      await request.json();
+
+    // Check content type to determine how to parse the request
+    const contentType = request.headers.get("content-type");
+    let requestData;
+    let pdfFile = null;
+
+    if (contentType && contentType.includes("multipart/form-data")) {
+      // Handle multipart form data (file upload)
+      const parseResult = await parseMultipartFormData(request);
+      if (!parseResult.success) {
+        return json(
+          { success: false, error: parseResult.error },
+          { status: 400 }
+        );
+      }
+
+      requestData = parseResult.data.fields;
+
+      // Check if PDF file was uploaded
+      if (parseResult.data.files.scheduleDocument) {
+        pdfFile = parseResult.data.files.scheduleDocument;
+
+        // Validate PDF file
+        const validation = await validateUploadedPDF(pdfFile);
+        if (!validation.valid) {
+          return json(
+            { success: false, error: validation.error },
+            { status: 400 }
+          );
+        }
+      }
+    } else {
+      // Handle JSON data (with base64 encoded file)
+      requestData = await request.json();
+
+      // Check if base64 PDF data was provided
+      if (requestData.pdfData && requestData.pdfFileName) {
+        try {
+          const pdfBuffer = base64ToBuffer(requestData.pdfData);
+          const validation = validatePDFFile(
+            pdfBuffer,
+            requestData.pdfFileName
+          );
+
+          if (!validation.valid) {
+            return json(
+              { success: false, error: validation.error },
+              { status: 400 }
+            );
+          }
+
+          pdfFile = {
+            name: requestData.pdfFileName,
+            buffer: pdfBuffer,
+            size: pdfBuffer.length,
+            type: "application/pdf",
+          };
+        } catch (error) {
+          return json(
+            { success: false, error: "Invalid PDF data provided" },
+            { status: 400 }
+          );
+        }
+      }
+    }
+
+    const { spaceId, startDate, endDate, shiftType } = requestData;
 
     // Validate required fields
     if (!spaceId || !startDate || !endDate || !shiftType) {
@@ -37,7 +111,8 @@ export async function POST({ request }) {
       );
     }
 
-    if (spaceId <= 1 || spaceId >= 20) {
+    // Validate space ID
+    if (spaceId < 1 || spaceId > 20) {
       return json(
         {
           success: false,
@@ -77,19 +152,19 @@ export async function POST({ request }) {
     const end = new Date(endDate);
     const daysDiff = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
 
-    if (daysDiff > 2 && !scheduleDocument) {
+    if (daysDiff > 2 && !pdfFile) {
       return json(
         {
           success: false,
           error:
-            "Schedule document is required for reservations longer than 2 days",
+            "PDF schedule document is required for reservations longer than 2 days",
         },
         { status: 400 }
       );
     }
 
     // Verify space exists
-    const spaceDoc = await getDoc(doc(db, "parkingSpaces", spaceId));
+    const spaceDoc = await getDoc(doc(db, "parkingSpaces", `space-${spaceId}`));
     if (!spaceDoc.exists()) {
       return json(
         {
@@ -102,7 +177,7 @@ export async function POST({ request }) {
 
     // Check space availability
     const isAvailable = await checkSpaceAvailability(
-      spaceId,
+      `space-${spaceId}`,
       startDate,
       endDate,
       shiftType
@@ -119,31 +194,83 @@ export async function POST({ request }) {
       );
     }
 
-    // Create reservation
+    // Create reservation first to get the ID
     const reservationData = {
       userId,
-      spaceId,
+      spaceId: `space-${spaceId}`,
       startDate,
       endDate,
       shiftType,
       status: "active",
       createdAt: new Date().toISOString(),
-      scheduleDocument: scheduleDocument || null,
+      hasPdfDocument: !!pdfFile,
+      pdfDocument: null, // Will be updated after upload
     };
 
     const docRef = await addDoc(
       collection(db, "reservations"),
       reservationData
     );
+    const reservationId = docRef.id;
+
+    // Upload PDF if provided
+    let pdfUploadResult = null;
+    if (pdfFile) {
+      pdfUploadResult = await uploadPDFToGoogleDrive(
+        pdfFile.buffer,
+        pdfFile.name,
+        userId,
+        reservationId
+      );
+
+      if (!pdfUploadResult.success) {
+        // If PDF upload fails, delete the reservation
+        await deleteDoc(doc(db, "reservations", reservationId));
+        return json(
+          {
+            success: false,
+            error: `Failed to upload PDF: ${pdfUploadResult.error}`,
+          },
+          { status: 500 }
+        );
+      }
+
+      // Update reservation with PDF information
+      await updateDoc(doc(db, "reservations", reservationId), {
+        pdfDocument: {
+          fileId: pdfUploadResult.fileId,
+          fileName: pdfUploadResult.fileName,
+          fileSize: pdfUploadResult.fileSize,
+          uploadedAt: pdfUploadResult.createdTime,
+        },
+      });
+    }
+
+    const finalReservationData = {
+      ...reservationData,
+      id: reservationId,
+      ...(pdfUploadResult && {
+        pdfDocument: {
+          fileId: pdfUploadResult.fileId,
+          fileName: pdfUploadResult.fileName,
+          fileSize: pdfUploadResult.fileSize,
+          uploadedAt: pdfUploadResult.createdTime,
+        },
+      }),
+    };
 
     return json(
       {
         success: true,
         message: "Reservation created successfully",
-        reservation: {
-          id: docRef.id,
-          ...reservationData,
-        },
+        reservation: finalReservationData,
+        ...(pdfUploadResult && {
+          pdfUpload: {
+            success: true,
+            fileId: pdfUploadResult.fileId,
+            fileName: pdfUploadResult.fileName,
+          },
+        }),
       },
       { status: 201 }
     );
