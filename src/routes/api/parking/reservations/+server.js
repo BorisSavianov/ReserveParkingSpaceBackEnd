@@ -37,6 +37,16 @@ export async function POST({ request }) {
       );
     }
 
+    if (spaceId <= 1 || spaceId >= 20) {
+      return json(
+        {
+          success: false,
+          error: "Space ID must be between 1 and 20",
+        },
+        { status: 400 }
+      );
+    }
+
     // Validate shift type
     const validShiftTypes = ["8:00-14:00", "14:00-21:00", "9:30-18:30"];
     if (!validShiftTypes.includes(shiftType)) {
